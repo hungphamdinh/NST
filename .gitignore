@@ -1,0 +1,9 @@
+*.pyc
+.DS_Store
+backup
+chroma
+env/
+results/
+phobert_feedback_finetuned/
+phobert_feedback_results/
+data/
