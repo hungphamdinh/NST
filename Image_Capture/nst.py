@@ -207,7 +207,7 @@ if __name__ == "__main__":
     loader, unloader = get_transforms(size)
 
     # Content image
-    content_path = "./data/generation/6.jpg"
+    content_path = "./data/generation/2.jpg"
     content_img  = load_image(content_path, loader, device)
 
     style_layers   = ['conv_1', 'conv_2', 'conv_3', 'conv_4', 'conv_5']

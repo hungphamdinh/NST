@@ -147,10 +147,8 @@ def compute_average_grams(style_dir, loader, vgg, device, style_layers):
 # 6. Training loop
 # -------------------------
 def train(args):
-    # Device
+    # Device & logger
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Logger setup
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s: %(message)s",
@@ -158,19 +156,31 @@ def train(args):
     )
     logger = logging.getLogger(__name__)
 
-    # Data transforms & loader
+    # Transforms & loader
+    normalize = transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std =[0.229, 0.224, 0.225]
+    )
     loader = transforms.Compose([
         transforms.Resize(args.image_size),
         transforms.CenterCrop(args.image_size),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485,0.456,0.406],
-                            std =[0.229,0.224,0.225])
+        normalize
     ])
     dataset = datasets.ImageFolder(args.content_dir, transform=loader)
     loader_dl = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
-    # VGG setup & average style grams
-    style_layers   = [f"conv_{i}" for i in range(1,6)]
+    # Log dataset/iteration info
+    num_batches = len(loader_dl)
+    total_iters = num_batches * args.epochs
+    logger.info(
+        f"Content: {len(dataset)} images, batch={args.batch_size} → "
+        f"{num_batches} batches/epoch, epochs={args.epochs} → "
+        f"{total_iters} total updates"
+    )
+
+    # VGG & style grams
+    style_layers   = [f"conv_{i}" for i in range(1, 6)]
     content_layers = ["conv_4"]
     vgg = VGGFeatures(style_layers, content_layers).to(device)
     avg_grams = compute_average_grams(
@@ -181,36 +191,33 @@ def train(args):
     transformer = TransformerNet().to(device)
     optimizer   = optim.Adam(transformer.parameters(), lr=args.lr)
 
-    # Resume from checkpoint if it exists
+    # Resume from checkpoint
     if os.path.isfile(args.model_out):
         logger.info(f"Loading checkpoint '{args.model_out}'")
-        checkpoint = torch.load(args.model_out, map_location=device)
-        # If you saved only state_dict:
-        transformer.load_state_dict(checkpoint)
-        # If you saved both model + optimizer:
-        # transformer.load_state_dict(checkpoint['model_state'])
-        # optimizer.load_state_dict(checkpoint['optim_state'])
+        chk = torch.load(args.model_out, map_location=device)
+        transformer.load_state_dict(chk)
         logger.info("Checkpoint loaded; continuing training")
 
-    # Training loop
-    tv_loss_fn  = TVLoss()
-    α = 100.0
-    style_weights = { L: α/len(style_layers) for L in style_layers }
-    # style_weights = {L: 1.0/len(style_layers) for L in style_layers}
-    num_batches = len(loader_dl)
-    total_iters = num_batches * args.epochs
-    logger.info(
-        f"Dataset: {len(dataset)} images, "
-        f"batch_size={args.batch_size} → {num_batches} batches/epoch, "
-        f"epochs={args.epochs} → {total_iters} total iterations"
-    )
-    tv_weight     = 1e-6
+    # Prepare denorm + PIL converter for snapshots
+    inv_mean = [-m/s for m, s in zip([0.485,0.456,0.406], [0.229,0.224,0.225])]
+    inv_std  = [1.0/s for s in [0.229,0.224,0.225]]
+    denorm   = transforms.Normalize(mean=inv_mean, std=inv_std)
+    to_pil   = transforms.ToPILImage()
 
+    # Loss weights
+    style_weight = 500.0
+    style_w = {L: style_weight/len(style_layers) for L in style_layers}
+    tv_weight = 1e-6
+    tv_loss_fn = TVLoss()
+
+    iteration = 0
     for epoch in range(1, args.epochs + 1):
         transformer.train()
-        total_loss = 0
+        total_loss = 0.0
+
         loop = tqdm(loader_dl, desc=f"Epoch {epoch}/{args.epochs}", unit="batch")
         for batch, _ in loop:
+            iteration += 1
             batch = batch.to(device)
             optimizer.zero_grad()
 
@@ -219,16 +226,14 @@ def train(args):
             _, c_orig   = vgg(batch)
 
             # Style loss
-            style_loss = 0
+            style_loss = 0.0
             for L in style_layers:
                 G_out = gram_matrix(s_out[L])
-                style_loss += style_weights[L] * nn.functional.mse_loss(G_out, avg_grams[L])
+                style_loss += style_w[L] * nn.functional.mse_loss(G_out, avg_grams[L])
 
-            # Content loss
+            # Content & TV loss
             content_loss = nn.functional.mse_loss(c_out["conv_4"], c_orig["conv_4"])
-
-            # TV loss
-            tv_loss = tv_weight * tv_loss_fn(out)
+            tv_loss      = tv_weight * tv_loss_fn(out)
 
             loss = style_loss + content_loss + tv_loss
             loss.backward()
@@ -241,13 +246,22 @@ def train(args):
                 tv=f"{tv_loss.item():.4f}"
             )
 
-        avg_loss = total_loss / len(loader_dl)
+            # Save a stylized snapshot every 500 updates
+            if iteration % 500 == 0:
+                img_t = out[0].detach().cpu()           # pick first image of batch
+                img_t = (img_t + 1.0) * 0.5             # from [-1,1] → [0,1]
+                img_t = denorm(img_t).clamp(0, 1)       # undo ImageNet norm
+                pil = to_pil(img_t)
+                os.makedirs("checkpoints", exist_ok=True)
+                pil.save(f"checkpoints/epoch{epoch}_iter{iteration}.png")
+
+        avg_loss = total_loss / num_batches
         logger.info(f"Epoch {epoch}/{args.epochs} — avg loss: {avg_loss:.4f}")
 
-    # Save final model (including optimizer state if you like)
+    # Save final model
     torch.save(transformer.state_dict(), args.model_out)
     logger.info(f"Model saved to {args.model_out}")
-
+    
 # -------------------------
 # 7. Inference helper
 # -------------------------
@@ -289,7 +303,7 @@ def stylize_image(args):
 
         # name the output by original filename
         base = os.path.basename(path)
-        out_img.save(f"./data/output2/stylized_{base}")
+        out_img.save(f"./data/output4/stylized_full{base}")
         print(f"Saved stylized_{base}")
 # -------------------------
 # 8. Argument parsing
